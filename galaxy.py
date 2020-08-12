@@ -23,7 +23,9 @@ Structure:
 
 import h5py as hdf
 import warnings
-
+from astropy.io  import fits
+from astropy.wcs import WCS
+from .utils import *
 
 
 class Galaxy:
@@ -32,13 +34,13 @@ class Galaxy:
     properties = {}
 
 
-    def __init__(self, name, filepath=None, **kwargs):
+    def __init__(self, name, filepath, **kwargs):
         """ Initialize the Galaxy object, identified by name, and its HDF5
         file located at filepath. If the HDF5 file doesn't exist, create one.
         If filepath is None, filepath="name.h5"
         """
 
-        filepath  = name + ".h5" if filepath is None else filepath
+        filepath = f"{filepath}/{name}.h5"
         self.name = name
         self.data = hdf.File(filepath, "a")
 
@@ -66,8 +68,29 @@ class Galaxy:
 
 
 
+    ############################################################################
+    ######################## Adding data to HDF5 File## ########################
+    ############################################################################
 
-    def add_data(self, dataset, filt, meta_dict, image,
+
+    def add_array(self, dataset, filt, name, data, overwrite=False):
+        path = f"{dataset}/{filt}/{name}"
+        self._add_array(path, data, overwrite)
+
+    def _add_array(self, path, data, overwrite=False):
+        """ Store an array data in the HDF5 file at path.
+        If overwrite=False and path already exists, do nothing."""
+
+        # if path in self.data:
+        #     if overwrite: del self.data[path]
+        #     else:
+        #         warnings.warn(f"{key} already exists in file, skipping. " +
+        #             "To overwrite, set overwrite=True")
+        #         return
+        if not clear_overwrite(path, self.data, overwrite): return
+        self.data[path] = data
+
+    def add_data(self, dataset, filt, meta_dict, image, wcs,
                  raw_mask=None, uncertainty=None, psf=None, mask=None, segmap=None,
                  overwrite=False):
         """
@@ -80,41 +103,41 @@ class Galaxy:
             image:      NumPy array with image data
             optional:   raw_mask, uncertainty, psf, mask, segmap data arrays
             overwrite:  Skip existing data arrays unless True
+        TODO:
+            allow input to be a fits file with image and header
+            allow input to be a CCDData
+            allow wcs input to be WCS, header or dict
         """
 
         # Paths of different data arrays in the HDF5 file
         path       = f"{dataset}/{filt}"
         data_types = {
             "image"     :   {"data" : image,        "path" : f"{path}/img"},
-            "raw_mask"  :   {"data" : raw_mask,     "path" : f"{path}/raw/mask"},
-            "uncertainty" : {"data" : uncertainty,  "path" : f"{path}/raw/unc"},
-            "psf"       :   {"data" : psf,          "path" : f"{path}/raw/psf"},
+            "raw_mask"  :   {"data" : raw_mask,     "path" : f"{path}/raw_mask"},
+            "uncertainty" : {"data" : uncertainty,  "path" : f"{path}/unc"},
+            "psf"       :   {"data" : psf,          "path" : f"{path}/psf"},
             "mask"      :   {"data" : mask,         "path" : f"{path}/products/mask"},
             "segmap"    :   {"data" : segmap,       "path" : f"{path}/products/segmap"},
         }
 
-        # Check if this node already exists
+        # Check if this node (dataset+filter) already exists and create if not
         node_exists = path in self.data
+        if not node_exists: self.data.create_group(path)
 
-        # Assign meta data to the dataset/filter directory
-        if not node_exists:
-            self.data.create_group(path)
+
+        # Assign meta data & WCS to the dataset/filter directory
         if not node_exists or overwrite:
+            # Write meta data
             for key, val in meta_dict.items():
+                self.data[path].attrs[key] = val
+            # Write wcs
+            for key, val in wcs.to_header().items():
                 self.data[path].attrs[key] = val
 
         # Write data to HDF5
         for key, val in data_types.items():
-
             if val["data"] is None: continue
-            if val["path"] in self.data:
-                if overwrite:
-                    del self.data[val["path"]]
-                else:
-                    warnings.warn(f"{key} already exists in file, skipping. " +
-                        "To overwrite, set overwrite=True")
-                    continue
-            self.data[val["path"]] = val["data"]
+            self._add_array(val["path"], val["data"], overwrite=overwrite)
 
 
     def add_metadata(self, path, **kwargs):
@@ -122,11 +145,10 @@ class Galaxy:
         for key, val in kwargs.items():
             self.data[path].attrs[key] = val
 
-
-
     def close(self):
         """ Close the HDF5 file, changes are saved"""
         self.data.close()
 
-    def hello(self):
-        print("Hello World! I'm a galaxy")
+    ############################################################################
+    ########################## Post-processing data ############################
+    ############################################################################
