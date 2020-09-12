@@ -1,17 +1,22 @@
 # Component/    parameter   constraint	Comment
 # operation	(see below)   range
 
-  #3_2_1_9          x          offset	# Hard constraint: Constrains the
+  1_2          x          offset	# Hard constraint: Constrains the
 					# x parameter for components 3, 2,
 					# 1, and 9 to have RELATIVE positions
 					# defined by the initial parameter file.
+
+  1_2          y          offset	# Hard constraint: Constrains the
+        					# x parameter for components 3, 2,
+        					# 1, and 9 to have RELATIVE positions
+        					# defined by the initial parameter file.
 
   #1_5_3_2	   re	      ratio     # Hard constraint: similar to above
 					# except constrain the Re parameters
 					# by their ratio, as defined by the
 					# initial parameter file.
 
-    1              n        0.1 to 5    # Soft constraint: Constrains the
+   # 1              n        0.1 to 5    # Soft constraint: Constrains the
 					# sersic index n to within values
 				        # from 0.7 to 5.
 
