@@ -67,7 +67,6 @@ class Galaxy:
         assert len(missing) == 0, f"Missing properties: {missing}"
 
 
-
     ############################################################################
     ######################## Adding data to HDF5 File## ########################
     ############################################################################
@@ -90,9 +89,9 @@ class Galaxy:
         if not clear_overwrite(path, self.data, overwrite): return
         self.data[path] = data
 
-    def add_data(self, dataset, filt, meta_dict, image, wcs,
+    def add_data(self, dataset, filt, image, wcs, meta_dict,
                  raw_mask=None, uncertainty=None, psf=None, mask=None, segmap=None,
-                 overwrite=False):
+                 psf_nsamp=None, diff_kernel=None, overwrite=False):
         """
         Saves the data for dataset, filter in the HDF5.
         Input:
@@ -116,8 +115,10 @@ class Galaxy:
             "raw_mask"  :   {"data" : raw_mask,     "path" : f"{path}/raw_mask"},
             "uncertainty" : {"data" : uncertainty,  "path" : f"{path}/unc"},
             "psf"       :   {"data" : psf,          "path" : f"{path}/psf"},
-            "mask"      :   {"data" : mask,         "path" : f"{path}/products/mask"},
-            "segmap"    :   {"data" : segmap,       "path" : f"{path}/products/segmap"},
+            "mask"      :   {"data" : mask,         "path" : f"{path}/mask"},
+            "segmap"    :   {"data" : segmap,       "path" : f"{path}/segmap"},
+            "kernel"    :   {"data" : diff_kernel,  "path" : f"{path}/diff_kernel"},
+            "psf_nsamp" :   {"data" : psf_nsamp,    "path" : f"{path}/psf_nsamp"}
         }
 
         # Check if this node (dataset+filter) already exists and create if not
@@ -133,6 +134,16 @@ class Galaxy:
             # Write wcs
             for key, val in wcs.to_header().items():
                 self.data[path].attrs[key] = val
+
+        # Check that the WCS has a PC matrix (sometimes has CD).
+        # TO DO: MAKE SURE CD IS NOT UNITARY (MULTIPLY BY PXSCALE)
+        try:    wcs.wcs.pc
+        except: wcs.wcs.pc = wcs.wcs.cd
+        # Calculate pixel scale if not passed in the meta_dict
+        if "pxscale" not in meta_dict.items():
+            pc       = wcs.wcs.pc
+            pxscale  = 3600 * np.sqrt( pc[0,0]**2 + pc[0,1]**2)
+            self.data[path].attrs["pxscale"] = pxscale
 
         # Write data to HDF5
         for key, val in data_types.items():

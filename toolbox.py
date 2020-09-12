@@ -103,7 +103,7 @@ def _morphology_dict( source_morph, dataset, zp, exptime, pxscale,
 
 
 
-def _galfit_make_temp_files(node, dataset, temp_path="."):
+def _galfit_make_temp_files(node, dataset, nsamp, temp_path="."):
     """Creates temporary files given the node in the file format required by galfit.
     Requires: img, psf, mask, dataset name, gain
     """
@@ -115,18 +115,29 @@ def _galfit_make_temp_files(node, dataset, temp_path="."):
     header["GAIN"]      = node.attrs["gain"]
     header["NCOMBINE"]  = 1
 
-    # HST stores data in counts / second
+    # HST stores data in counts / second, SDSS in nmgy
     if dataset == "hst": image[()] = image * node.attrs["exptime"]
+    # elif dataset == "sdsss": image[()] = image * node.attrs["exptime"] * node.attrs["nmgy"]
     imfile = fits.PrimaryHDU(image[()], header=header)
     imfile.writeto(f"{temp_path}/image.fits", overwrite=True)
 
     ## Other files for GALFIT
     ## todo: uncertainty. For now, GALFIT calculates uncertainty
-    filetypes = ["psf", "mask"]
+    if nsamp == 1:    filetypes = ["psf", "mask"]
+    else: filetypes = ["psf_nsamp", "mask"]
+
     for type in filetypes:
         data  = node[type]
         dfile = fits.PrimaryHDU(data[()])
         dfile.writeto(f"{temp_path}/{type}.fits", overwrite=True)
+    # Diffusion kernel: should be a txt
+    if nsamp > 1:
+        kernel = node["diff_kernel"][()]
+        with open(f"{temp_path}/kernel.txt", "w") as dfile:
+            text = np.array_str(kernel).replace('[','')
+            text = text.replace(']','').replace('\n ', '\n')
+            dfile.write(text)
+
 
 def _galfit_get_value(input):
     string = [s.strip('*') for s in input.split()]
@@ -178,6 +189,7 @@ class GalaxyAnalyzer:
         self.wcs  = attr_to_wcs(self.data.attrs)
         self.survey = survey
         self.filt   = filt
+        self.module_dir = os.path.split(__file__)[0]
 
         # Check if the required metadata is given in the header
         assert "img" in self.data, "Dataset img must be in the HDF5 node"
@@ -185,13 +197,30 @@ class GalaxyAnalyzer:
 
         # Calculate sky value for later if not already calculated
         try:
-            assert_properties(["sky_mean", "sky_med", "sky_rms"])
+            assert_properties(["sky_mean", "sky_med", "sky_rms"], node)
         except:
-            mask = None if "raw_mask" not in node else node["raw_mask"]
+            mask = None if "raw_mask" not in node else node["raw_mask"][()]
             mean, med, std = sigma_clipped_stats(node["img"], mask=mask)
             node.attrs["sky_mean"] = mean
             node.attrs["sky_med"]  = med
             node.attrs["sky_rms"]  = std
+
+    def get_uncertainty(self, overwrite=False):
+        '''Calculate poisson and sky uncertainty for the image, assuming the
+        image is in flux units (units/second).
+        Variance = Flux / (Gain x Exp.time) + Sky RMS^2'''
+
+        if not clear_overwrite("error", self.data, overwrite): return
+        assert_properties(["exptime", "gain"], self.data)
+
+        exptime = self.data.attrs["exptime"]
+        gain    = self.data.attrs["gain"]
+
+        poisson = self.data["img"][()]/(exptime*gain)
+        if self.survey == "sdss": poisson = poisson * self.data.attrs["nmgy"]
+
+        unc     = np.sqrt(poisson + self.data.attrs["sky_rms"]**2)
+        self.data["error"] = unc
 
     ############################################################################
     ################ IMAGE SEGMENTATION (UNDER CONSTRUCTION) ###################
@@ -296,42 +325,98 @@ class GalaxyAnalyzer:
     given by path (or, by default, root of the kernel). Delete when galfit runs.
     Conversion depends on the survey, since data is stored in different units.
     '''
-    def run_galfit(self, temp_path='.', constraints_path=None,
+    def run_galfit(self, components=1, mask_cent=False,
+                    temp_path='.', constraints_path=None,
                     numiters=100, overwrite=False ):
         """
         Run single-component galfit; requires a previous statmorph run
         to estimate the starting parameters
         """
 
-        assert_properties(["exptime", "gain", "pxscale"], self.data)
-        assert_data(["img", "psf", "mask", "statmorph"], self.data)
-        if not clear_overwrite("galfit", self.data, overwrite): return
+        # Figure out the extension
+        ext = f"{components}comp"
+        if mask_cent: ext = ext + "_masked"
+        nodepath = f"galfit/{ext}"
+        print(nodepath)
 
-        ## Save data files
-        _galfit_make_temp_files(self.data, self.survey, temp_path)
+        assert_properties(["exptime", "gain", "pxscale", "psf_fwhm"], self.data)
+        assert_data(["img", "mask", "statmorph"], self.data)
+        if not clear_overwrite(f"{nodepath}", self.data, overwrite): return
+
+
+        ## GALFIT parameters
+        morphs      = dict(self.data["statmorph"].attrs)
+        yc, xc      = morphs['y'], morphs['x'] # Galaxy center from statmorph
+        ymax, xmax  = self.data["img"].shape  # Image size
+        boxsize     = int(0.3 * np.min([xmax, ymax])) # Convolution box
+        pxscale     = self.data.attrs["pxscale"]
+        sky_mean    = self.data.attrs["sky_mean"]
+        zp          = self.data.attrs["zp"]
+        fwhm        = self.data.attrs["psf_fwhm"] / pxscale
+
+
+        # Chose which PSF to use for GALFIT: oversampled or not
+        if "psf_nsamp" in self.data:
+            assert_properties(["psf_nsamp"], self.data)
+            psf_file = f"{temp_path}/psf.fits {temp_path}/kernel.txt"
+            nsamp    = self.data.attrs["psf_nsamp"]
+        else:
+            assert_data(["psf"], self.data)
+            psf_file = f"{temp_path}/psf.fits"
+            nsamp    = 1
+
+        ## Save temporary files for GALFIT to use
+        ## Image file for GALFIT
+        image  = self.data["img"][()]
+        header = fits.Header()
+        header["EXPTIME"]   = self.data.attrs["exptime"]
+        header["GAIN"]      = self.data.attrs["gain"]
+        header["NCOMBINE"]  = 1
+        # HST stores data in counts / second, SDSS in nmgy
+        if self.survey == "hst": image[()] = image * self.data.attrs["exptime"]
+        # elif dataset == "sdsss": image[()] = image * node.attrs["exptime"] * node.attrs["nmgy"]
+        imfile = fits.PrimaryHDU(image[()], header=header)
+        imfile.writeto(f"{temp_path}/image.fits", overwrite=True)
+
+
+        # Save PSF and the Diffusion kernel (kernel should be a txt)
+        if nsamp > 1:
+            psf    = self.data["psf_nsamp"]
+            kernel = self.data["diff_kernel"][()]
+            with open(f"{temp_path}/kernel.txt", "w") as dfile:
+                text = np.array_str(kernel).replace('[','')
+                text = text.replace(']','').replace('\n ', '\n')
+                dfile.write(text)
+        else: psf    = self.data["psf"]
+        fits.PrimaryHDU(psf[()]).writeto(f"{temp_path}/psf.fits", overwrite=True)
+
+        # Save the mask
+        mask = self.data["mask"][()]
+        if mask_cent:
+            size = int(5*fwhm) # Cental 5 FWHM's
+            mask[int(yc)-size:int(yc)+size, int(xc)-size:int(xc)+size] = 1
+        fits.PrimaryHDU(mask[()]).writeto(f"{temp_path}/mask.fits", overwrite=True)
+
 
         ## Constraint file: unnless passed, use the default one
         if constraints_path is None:
-            constraints_path = "galfit_constraints.txt" ### how to point to root directory of the library???
+            constraints_path = f"{self.module_dir}/galfit_constraints.txt" ### how to point to root directory of the library???
 
-        ## GALFIT parameters
-        ymax, xmax  = self.data["img"].shape  # Image size
-        boxsize     = int(0.1 * np.min([xmax, ymax])) # Convolution box
-        morphs      = dict(self.data["statmorph"].attrs)
-        pxscale     = self.data.attrs["pxscale"]
-        sky_mean    = self.data.attrs["sky_mean"]
+
+        # if self.survey == "sdss": zp = zp - 2.5*np.log10(self.data.attrs["nmgy"])
 
         ## Parameter file for GALFIT
         params = {
               "A)" : f"{temp_path}/image.fits", # Input image
               "B)" : f"{temp_path}/output.fits", # Output image filename
               "C)" : f"none",#%s/galfit/%s/temp_data/sigma.fits" % (path, filt),# % (path, filt), #"none", # Uncertainty (weight) image -- 1 sigma deviation including counting and sky RMS
-              "D)" : f"{temp_path}/psf.fits",#"%s" % psf,
+              "D)" : f"{psf_file}",#"%s" % psf,
+              "E)" : f"{nsamp}", # PSF fine sampling factor relative to data
               "F)" : f"{temp_path}/mask.fits", # Mask
               "G)" : f"{constraints_path}", # Parameter coupling: constraints
               "H)" : f"0 {xmax:d} 0 {ymax:d}", # Fitting region -- entire image
               "I)" : f"{boxsize} {boxsize}", # Convolution box size
-              "J)" : f"{self.data.attrs['zp']:2.2f}", # ZP to convert fluxes into magnitudes
+              "J)" : f"{zp:2.2f}", # ZP to convert fluxes into magnitudes
               "K)" : f"{pxscale} {pxscale}", # Pixel scale
               "O)" : f"regular", # Interactive window - off
               "P)" : f"0"} # Options (normal run)
@@ -339,8 +424,8 @@ class GalaxyAnalyzer:
         # Sersic function
         sersic_params = {
             "0)"  : "sersic", # Type of fit
-             "1)"  : f"{morphs['x']:0.0f} {morphs['y']:0.0f} 1 1", # x and y positions of the galaxy
-             "3)"  : f"{morphs['mag']:0.2f} 1", # Integrated magnitude of a galaxy
+             "1)"  : f"{xc:0.0f} {yc:0.0f} 1 1", # x and y positions of the galaxy
+             "3)"  : f"{(morphs['mag']):0.2f} 1", # Integrated magnitude of a galaxy
              "4)"  : f"{morphs['sersic_rhalf']/pxscale:0.2f} 1", # Scale length in pixels
              "5)"  : f"{morphs['sersic_n']:0.2f} 1", # Sersic index, n
              "9)"  : f"{morphs['sersic_ellip']:0.2f} 1", # Ellipticity: 1 = circle, < 1 = ellipse
@@ -348,23 +433,62 @@ class GalaxyAnalyzer:
              "Z)" : "0" # Subtract the model in the final image? 1=no, 0=yes to get residual
         }
 
+        sersic_params2 = {
+            "0)"  : "sersic", # Type of fit
+             "1)"  : f"{morphs['x']:0.0f} {morphs['y']:0.0f} 1 1", # x and y positions of the galaxy
+             "3)"  : f"{(morphs['mag']):0.2f} 1", # Integrated magnitude of a galaxy
+             "4)"  : f"{morphs['sersic_rhalf']/pxscale/10:0.2f} 1", # Scale length in pixels
+             "5)"  : f"{4:0.2f} 1", # Sersic index, n
+             "9)"  : f"{morphs['sersic_ellip']:0.2f} 1", # Ellipticity: 1 = circle, < 1 = ellipse
+             "10)" : f"{morphs['sersic_theta']*180/np.pi:0.2f} 1", # Position angle
+             "Z)" : "0" # Subtract the model in the final image? 1=no, 0=yes to get residual
+        }
+
         # Sersic function
+        disk_params = {
+            "0)"  : "expdisk", # Type of fit
+             "1)"  : f"{morphs['x']:0.0f} {morphs['y']:0.0f} 1 1", # x and y positions of the galaxy
+             "3)"  : f"{(morphs['mag']):0.2f} 1", # Integrated magnitude of a galaxy
+             "4)"  : f"{morphs['sersic_rhalf']/pxscale:0.2f} 1", # Scale length in pixels
+             "9)"  : f"{morphs['sersic_ellip']:0.2f} 1", # Ellipticity: 1 = circle, < 1 = ellipse
+             "10)" : f"{morphs['sersic_theta']*180/np.pi:0.2f} 1", # Position angle
+             "Z)" : "0" # Subtract the model in the final image? 1=no, 0=yes to get residual
+        }
+
+        # Sky background
         sky_params = {
              "0)"  : "sky", # Type of fit
              "1)"  : f"{sky_mean} 1 ", # Sky background
-             "2)"  : "0 1", # x gradient dF/dx
-             "3)"  : "0 1", # y gradient dF/dy
+             "2)"  : "0 0", # x gradient dF/dx
+             "3)"  : "0 0", # y gradient dF/dy
              "Z)" : "0" # Subtract the model in the final image? 1=no, 0=yes to get residual
         }
+
+        # PSF
+        # psf_params = {
+        #      "0)"  : "psf", # Type of fit
+        #      "1)"  : f"{morphs['x']:0.0f} {morphs['y']:0.0f} 1 1", #position
+        #      "3)"  : f"{(morphs['mag']+1):0.2f} 1", #magnitude
+        #      "Z)" : "0" # Subtract the model in the final image? 1=no, 0=yes to get residual
+        # }
 
         # Write the galfit paramfile in the temporary file
         paramfile = open(f"{temp_path}/input.txt", "w")
         for key, value in params.items():
             paramfile.write(f"{key} {value}\n")
-        paramfile.write("\n")
-        for key, value in sersic_params.items():
-            paramfile.write(f"{key} {value}\n")
-        paramfile.write("\n")
+
+        # One component sersic fit
+        if components == 1:
+            for key, value in sersic_params.items():
+                paramfile.write(f"{key} {value}\n")
+
+        # Two component sersic + exponential disk fit
+        elif components == 2:
+            for key, value in sersic_params2.items():
+                paramfile.write(f"{key} {value}\n")
+            for key, value in disk_params.items():
+                paramfile.write(f"{key} {value}\n")
+
         for key, value in sky_params.items():
             paramfile.write(f"{key} {value}\n")
         paramfile.close()
@@ -375,24 +499,87 @@ class GalaxyAnalyzer:
 
         # Save output.fits to node
         outfile = fits.open(f"{temp_path}/output.fits")
-        self.data["galfit/fit"]         = outfile[2].data
-        self.data["galfit/residual"]    = outfile[3].data
+        self.data[f"{nodepath}/fit"]         = outfile[2].data
+        self.data[f"{nodepath}/residual"]    = outfile[3].data
         fit_params = _galfit_param_dict(outfile[2].header, pxscale)
         for key, value in fit_params.items():
-            self.data["galfit"].attrs[key] = value
+            self.data[f"{nodepath}"].attrs[key] = value
 
         # Delete temp files
-        files = ["image.fits", "psf.fits", "mask.fits", "input.txt", "output.fits"]
-        for file in files:
-            cmd = f"rm {temp_path}/{file}"
-            os.system(cmd)
+        # files = ["image.fits", "psf.fits", "mask.fits", "input.txt", "output.fits",
+                    # "galfit.01", "fit.log", "kernel.txt"]
+        # for file in files:
+        #     cmd = f"rm {temp_path}/{file}"
+        #     os.system(cmd)
 
 
     ############################################################################
     ################################# Morph. Analysis ##########################
     ############################################################################
 
-    def get_rff(self):
+    def get_rff(self, region="all", rpet_scale=2, rhalf_scale=1, overwrite=False):
+        """Calculate the residual flux fraction, defined in Hoyos et al. (2011, 2012)
+        RFF = (I(res) - 0.8 sky_rms )/I(model). We calculate RFF within a Petrosian
+        radius, calculated by statmorph.
+        There are 3 modes:
+            1. Total RFF within KRpet
+            2. RFF within inner KR_0.5
+            3. RFF within outer KR_0.5 and Kxrpet
+        INPUTS:
+            region:         region of RFF calculation (all, inner, outer)
+            rpet_scale:     number of Petrosian radii wihin which RFF is found
+            rhalf_scale:    number of Sersic radii defining inner region for inner/outer
+            overwrite:      overwrite existing RFF meausrement for this region?
+            """
 
+        # Check all required data exists
         assert_properties(["pxscale"], self.data)
-        assert_data(["img", "mask", "galfit"], self.data)
+        assert_data(["img", "mask", "galfit", "statmorph"], self.data)
+
+        # Check if RFF is already computed
+        kwords  = {"all" : "rff", "inner": "rff_in", "outer" : "rff_out"}
+        kword   = kwords[region]
+        if not clear_overwrite(kword, self.data["galfit"].attrs): return
+
+        # Define values needed for calculation
+        pxscale = self.data.attrs["pxscale"]
+        rpet    = self.data["statmorph"].attrs["rpetro_circ"] / pxscale
+        xc      = self.data["galfit"].attrs["xc"]
+        yc      = self.data["galfit"].attrs["yc"]
+        mask    = self.data["mask"]
+        res     = self.data["galfit/residual"]
+        model   = self.data["galfit/fit"]
+
+        # 1. Calculate standard deviation of residual bg
+        __, bgmed, bgdev = sigma_clipped_stats(res, mask=self.data["mask"])
+        res     = res-bgmed
+
+        # 2. Define aperture based on RFF region
+        ap_pet  = phot.CircularAperture( (xc, yc), rpet_scale*rpet)
+        if region != "all":
+            e       = self.data["galfit"].attrs["e"]
+            pa      = self.data["galfit"].attrs["theta"]
+            th      = (pa-90)*np.pi/180
+            rhalf   = self.data["galfit"].attrs["rad"] / pxscale
+            ap_ser  = phot.EllipticalAperture((xc, yc), rhalf, rhalf*e, theta=th)
+
+        if region == "inner":
+            ap      = ap_ser
+        elif region == "outer":
+            ap      = ap_pet
+            ap_mask = ap_ser.to_mask().to_image(mask.shape)
+            mask    = np.logical_or(mask, ap_mask)
+        elif region == "all":
+            ap      = ap_pet
+
+        # 3. Calculate residual and model flux
+        resflux = ap.do_photometry(np.abs(res),   mask=mask)[0][0]
+        modflux = ap.do_photometry(model,         mask=mask)[0][0]
+
+        # 4. Number of pixels in the sum:
+        numpix  = ap.area - ap.do_photometry(mask)[0][0]
+        bgflux  = np.sqrt(2/np.pi) * bgdev * numpix
+
+        # 5. Compute RFF
+        rff = (resflux - bgflux) / modflux
+        self.data["galfit"].attrs[kword]  = rff
